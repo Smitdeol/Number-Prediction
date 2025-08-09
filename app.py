@@ -1,69 +1,58 @@
 import streamlit as st
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+import pandas as pd
 from collections import Counter
 import random
 
 st.set_page_config(page_title="Magnum Life Predictor", layout="wide")
 st.title("🎯 Magnum Life Prediction (Malaysia)")
 
-# Step 1: Scrape past results from Lottolyzer
-st.subheader("Fetching latest results...")
+st.subheader("Fetching latest results from Magnum Life official page...")
 
-url = "https://en.lottolyzer.com/history/malaysia/magnum-life/page/1/per-page/50/number-view"
+url = "https://www.magnum4d.my/en/Magnum-Life"
 headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/115.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15"
 }
 
 try:
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        st.error(f"Failed to fetch data. HTTP Status: {response.status_code}")
+    resp = requests.get(url, headers=headers, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Extract past draws: each draw block contains numbers
+    draw_blocks = soup.select("div.draw-result") or soup.select("div.results-row")
+    draws = []
+    for block in draw_blocks:
+        nums = [int(n.get_text()) for n in block.find_all(class_="number") if n.get_text().isdigit()]
+        if len(nums) >= 8:
+            draws.append(nums[:8])
+
+    if not draws:
+        st.error("No past numbers found. Page structure may have changed.")
         st.stop()
 
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    # Extract numbers from table
-    numbers_list = []
-    for cell in soup.select("td.number"):
-        num_text = cell.get_text(strip=True)
-        if num_text.isdigit():
-            numbers_list.append(int(num_text))
-
-    if not numbers_list:
-        st.error("No numbers found. The website might have changed its structure.")
-        st.stop()
-
-    # Group into draws of 8
-    draws = [numbers_list[i:i+8] for i in range(0, len(numbers_list), 8)]
-
-    # Put into DataFrame
     df = pd.DataFrame(draws, columns=[f"Num {i+1}" for i in range(8)])
     st.subheader("📅 Past Draws")
     st.dataframe(df)
 
 except Exception as e:
-    st.error(f"Error fetching data: {e}")
+    st.error(f"Error fetching results: {e}")
     st.stop()
 
-# Step 2: Frequency Analysis
+# Frequency analysis
 st.subheader("🔍 Frequency Analysis")
-all_numbers = [num for draw in draws for num in draw]
-frequency = Counter(all_numbers)
-freq_df = pd.DataFrame(frequency.items(), columns=["Number", "Frequency"])
-freq_df = freq_df.sort_values(by="Frequency", ascending=False)
+all_nums = [n for draw in draws for n in draw]
+counter = Counter(all_nums)
+freq_df = pd.DataFrame(counter.items(), columns=["Number", "Frequency"]).sort_values("Frequency", ascending=False)
 st.dataframe(freq_df)
 
-# Step 3: Prediction (most frequent numbers)
+# Prediction — most frequent
 st.subheader("🎯 Predicted Numbers (Most Frequent)")
-top_numbers = [num for num, count in frequency.most_common(8)]
-st.write("Based on frequency analysis, the predicted numbers are:")
-st.write(top_numbers)
+most_common = [n for n,_ in counter.most_common(8)]
+st.write(most_common)
 
-# Step 4: Random Prediction (optional)
+# Add random quick pick
 st.subheader("🎲 Random Quick Pick")
-random_numbers = random.sample(range(1, 38), 8)
-st.write(random_numbers)
+st.write(random.sample(range(1,37), 8))
