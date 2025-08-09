@@ -1,61 +1,221 @@
+# streamlit_app.py
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 from collections import Counter
 import random
+import os
+import time
+import re
+import io
+import plotly.express as px
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Magnum Life Predictor", layout="wide")
-st.title("🎯 Magnum Life Prediction (Malaysia)")
+# ---------- Config ----------
+st.set_page_config(page_title="Magnum Life Dashboard", layout="wide")
+st.title("🎯 Magnum Life Prediction Dashboard")
 
-st.subheader("Fetching latest results from Lottolyzer...")
-
-# Pages to scrape (1 and 2)
-base_url = "https://en.lottolyzer.com/history/malaysia/magnum-life/page/{}/per-page/50/number-view"
-headers = {
+LOTTOLYZER_BASE = "https://en.lottolyzer.com/history/malaysia/magnum-life/page/{}/per-page/50/number-view"
+HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/115.0.0.0 Safari/537.36")
 }
+CACHE_FILENAME = "past_results.csv"
+CACHE_MAX_AGE_HOURS = 24  # how old a cache is allowed before re-scrape
+PAGES_TO_SCRAPE = 5       # how many pages to scrape for history (you can adjust)
+NUMBERS_PER_DRAW = 8
+TOTAL_NUMBERS = 36
 
-all_draws = []
+# ---------- Helpers ----------
+def is_cache_fresh(path=CACHE_FILENAME, max_age_hours=CACHE_MAX_AGE_HOURS):
+    if not os.path.exists(path):
+        return False
+    mtime = os.path.getmtime(path)
+    age = datetime.now() - datetime.fromtimestamp(mtime)
+    return age < timedelta(hours=max_age_hours)
 
-for page in [1, 2]:
-    url = base_url.format(page)
-    resp = requests.get(url, headers=headers)
-    if resp.status_code != 200:
-        st.error(f"Failed to fetch page {page}: HTTP {resp.status_code}")
-        st.stop()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    # Each draw is a div (or li). We'll collect image alt attributes for numbers
-    imgs = soup.find_all("img", alt=lambda x: x and x.isdigit())
-    nums = [int(img['alt']) for img in imgs]
-    # Group into draws of 8 numbers
-    for i in range(0, len(nums), 8):
-        draw = nums[i:i+8]
-        if len(draw) == 8:
-            all_draws.append(draw)
+def save_cache(df, path=CACHE_FILENAME):
+    df.to_csv(path, index=False)
 
-if not all_draws:
-    st.error("No draws found — site structure may have changed.")
+def load_cache(path=CACHE_FILENAME):
+    return pd.read_csv(path, parse_dates=['date'], dayfirst=True, infer_datetime_format=True)
+
+def scrape_lottolyzer_pages(pages=1):
+    rows = []
+    date_regex = re.compile(r'(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}|\w+\s+\d{1,2},\s*\d{4})')
+    for page in range(1, pages+1):
+        url = LOTTOLYZER_BASE.format(page)
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # Approach: iterate over table rows (tr) and parse each row's date + images alt numbers
+        # This is best-effort: fallback to grouping images sequentially if no tr rows found
+        found = False
+        for tr in soup.select("tr"):
+            # try to find date cell
+            date_text = None
+            # common patterns: td.date, td:first-child, or a cell that looks like date
+            td_date = tr.find("td", class_=re.compile("date", re.I)) or tr.find("td")
+            if td_date:
+                txt = td_date.get_text(" ", strip=True)
+                m = date_regex.search(txt)
+                if m:
+                    date_text = m.group(0)
+            # collect numbers via img alt or td.number text
+            nums = []
+            # images with alt numbers
+            for img in tr.find_all("img", alt=True):
+                alt = img.get("alt", "").strip()
+                if alt.isdigit():
+                    nums.append(int(alt))
+            # fallback: look for td.number text nodes
+            if not nums:
+                for td in tr.find_all("td"):
+                    if td.get("class") and any("number" in c.lower() for c in td.get("class")):
+                        t = td.get_text(strip=True)
+                        if t.isdigit():
+                            nums.append(int(t))
+            if nums:
+                found = True
+                if len(nums) >= NUMBERS_PER_DRAW:
+                    rows.append({
+                        "date": date_text,
+                        **{f"n{i+1}": nums[i] for i in range(NUMBERS_PER_DRAW)}
+                    })
+        # If nothing found via table rows, fallback to grouping all imgs sequentially
+        if not found:
+            imgs = soup.find_all("img", alt=lambda a: a and a.strip().isdigit())
+            nums = [int(img['alt'].strip()) for img in imgs]
+            for i in range(0, len(nums), NUMBERS_PER_DRAW):
+                group = nums[i:i+NUMBERS_PER_DRAW]
+                if len(group) == NUMBERS_PER_DRAW:
+                    rows.append({
+                        "date": None,
+                        **{f"n{i+1}": group[i] for i in range(NUMBERS_PER_DRAW)}
+                    })
+    # Build dataframe
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    # normalize date column
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce', dayfirst=True, infer_datetime_format=True)
+    # remove duplicates and keep most recent occurrence (if any dates)
+    df = df.drop_duplicates().reset_index(drop=True)
+    # If date null, we keep them but will not sort by date
+    return df
+
+def build_frequency(df):
+    nums = []
+    for i in range(1, NUMBERS_PER_DRAW+1):
+        col = f"n{i}"
+        if col in df.columns:
+            nums.extend(df[col].dropna().astype(int).tolist())
+    cnt = Counter(nums)
+    freq_df = pd.DataFrame([(n, cnt.get(n,0)) for n in range(1, TOTAL_NUMBERS+1)], columns=["Number","Frequency"])
+    freq_df = freq_df.sort_values(by="Frequency", ascending=False).reset_index(drop=True)
+    return freq_df
+
+def top_three_sets_by_freq(freq_df):
+    # top 24 numbers by frequency; form three sets of 8
+    top24 = freq_df['Number'].tolist()[:24]
+    sets = []
+    for i in range(3):
+        start = i*8
+        subset = sorted(top24[start:start+8])
+        sets.append(subset)
+    return sets
+
+def render_number_badge(n, hot_set):
+    # return HTML badge; hot numbers in red
+    if n in hot_set:
+        return f"<span style='display:inline-block;margin:3px;padding:6px 10px;border-radius:8px;background:#ffecec;color:#b30000;font-weight:700'>{n}</span>"
+    else:
+        return f"<span style='display:inline-block;margin:3px;padding:6px 10px;border-radius:8px;background:#eef6ff;color:#0a3f6b'>{n}</span>"
+
+# ---------- Load or scrape data ----------
+st.info("Loading past results (cache-aware)...")
+df = None
+try:
+    if is_cache_fresh():
+        try:
+            df = load_cache()
+            st.success(f"Loaded past results from cache ({len(df)} draws).")
+        except Exception:
+            df = None
+
+    if df is None:
+        # scrape pages
+        with st.spinner("Scraping history from Lottolyzer (this may take a few seconds)..."):
+            scraped = scrape_lottolyzer_pages(pages=PAGES_TO_SCRAPE)
+            if scraped.empty:
+                st.error("Unable to parse any draws from Lottolyzer. Please check source or try again later.")
+                st.stop()
+            # save to cache
+            # ensure columns exist n1..n8
+            for i in range(1, NUMBERS_PER_DRAW+1):
+                col = f"n{i}"
+                if col not in scraped.columns:
+                    scraped[col] = None
+            scraped = scraped[['date'] + [f"n{i}" for i in range(1, NUMBERS_PER_DRAW+1)]]
+            scraped.to_csv(CACHE_FILENAME, index=False)
+            df = scraped
+            st.success(f"Scraped and cached {len(df)} draws.")
+except Exception as e:
+    st.error(f"Failed to load or scrape data: {e}")
     st.stop()
 
-df = pd.DataFrame(all_draws, columns=[f"Num {i+1}" for i in range(8)])
-st.subheader("📅 Past Draws (Most Recent First)")
-st.dataframe(df)
+# ---------- Build analytics ----------
+freq_df = build_frequency(df)
+sets = top_three_sets_by_freq(freq_df)
+hot_numbers = set(freq_df['Number'].tolist()[:8])  # top 8 considered "hot"
 
-# Frequency analysis
-st.subheader("🔍 Frequency Analysis")
-all_numbers = [num for draw in all_draws for num in draw]
-counter = Counter(all_numbers)
-freq_df = pd.DataFrame(counter.items(), columns=["Number", "Frequency"]).sort_values("Frequency", ascending=False)
-st.dataframe(freq_df)
+# ---------- UI Layout: Tabs ----------
+tab1, tab2, tab3 = st.tabs(["Predictions", "Past Results", "Frequency Graph"])
 
-# Predictions
-st.subheader("🎯 Predicted Numbers (Most Frequent)")
-predicted = [num for num, _ in counter.most_common(8)]
-st.write(predicted)
+with tab1:
+    st.header("Top 3 Predicted Sets (based on historical frequency)")
+    st.write(f"*Based on {len(df)} draws | Cache age: {time.ctime(os.path.getmtime(CACHE_FILENAME))}*")
 
-# Random quick pick
-st.subheader("🎲 Random Quick Pick")
-st.write(random.sample(range(1, 37), 8))
+    for i, s in enumerate(sets, start=1):
+        # render badges with highlighting for hot numbers
+        badges = " ".join(render_number_badge(n, hot_numbers) for n in s)
+        st.markdown(f"**Set {i}** — {badges}", unsafe_allow_html=True)
+    st.markdown("---")
+    st.subheader("Quick Picks (randomized — for variety)")
+    quicks = [sorted(random.sample(range(1, TOTAL_NUMBERS+1), NUMBERS_PER_DRAW)) for _ in range(5)]
+    for i, q in enumerate(quicks, start=1):
+        st.write(f"Quick {i}: {', '.join(map(str,q))}")
+
+with tab2:
+    st.header("Past Draws (collapsed by default)")
+    with st.expander("Show past draws table (click to expand)", expanded=False):
+        # Display date column and numbers in columns for easy viewing
+        display_df = df.copy()
+        # format date for display
+        if 'date' in display_df.columns:
+            display_df['date'] = pd.to_datetime(display_df['date'], errors='coerce')
+        display_df = display_df.rename(columns={f"n{i}": f"{i}" for i in range(1, NUMBERS_PER_DRAW+1)})
+        # reorder columns: date, 1..8
+        cols = ['date'] + [str(i) for i in range(1, NUMBERS_PER_DRAW+1)]
+        available_cols = [c for c in cols if c in display_df.columns]
+        st.dataframe(display_df[available_cols].sort_values(by='date', ascending=False).reset_index(drop=True), use_container_width=True)
+        # download button
+        csv_buf = io.StringIO()
+        display_df.to_csv(csv_buf, index=False)
+        st.download_button("Download past_results.csv", csv_buf.getvalue(), file_name="past_results.csv", mime="text/csv")
+
+with tab3:
+    st.header("Frequency Graph")
+    st.write("Top numbers by historical frequency (higher = hotter)")
+    fig = px.bar(freq_df, x='Number', y='Frequency', title='Number Frequency', labels={'Frequency':'Count','Number':'Number'})
+    st.plotly_chart(fig, use_container_width=True)
+    # download freq CSV
+    freq_buf = io.StringIO()
+    freq_df.to_csv(freq_buf, index=False)
+    st.download_button("Download frequency.csv", freq_buf.getvalue(), file_name="frequency.csv", mime="text/csv")
+
+st.caption("Disclaimer: predictions are probabilistic suggestions based on past draws. No guarantee of winnings.")
