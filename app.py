@@ -1,293 +1,90 @@
-# streamlit_app.py
 import streamlit as st
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd
 from collections import Counter
 import random
-import re
 import time
-from datetime import datetime
-import math
 
-# ---------- Config ----------
-st.set_page_config(page_title="Magnum Life - Full History", layout="wide")
-st.title("🎯 Magnum Life — Full History Predictor")
+# --- Function to scrape past results ---
+def scrape_results():
+    base_url = "https://en.lottolyzer.com/history/malaysia/magnum-life/page/{}/per-page/50/number-view"
+    all_results = []
 
-LOTTOLYZER_PAGE_TEMPLATE = "https://en.lottolyzer.com/history/malaysia/magnum-life/page/{}/per-page/50/number-view"
-HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/115.0.0.0 Safari/537.36")
-}
-REQUEST_TIMEOUT = 15
-PAUSE_BETWEEN_REQUESTS = 0.6  # seconds (be polite)
-NUMBERS_PER_DRAW = 8
-TOTAL_NUMBERS = 36
-MAX_PAGES_SAFEGUARD = 200  # safety cap in case pagination is huge or site loops
+    page = 1
+    while True:
+        url = base_url.format(page)
+        res = requests.get(url)
+        if res.status_code != 200:
+            break
 
-# ---------- Helpers ----------
-def fetch(url):
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        return resp
-    except Exception as e:
-        raise RuntimeError(f"Request failed: {e}")
+        soup = BeautifulSoup(res.text, "html.parser")
+        rows = soup.select("table tbody tr")
+        if not rows:
+            break
 
-def detect_total_pages(soup):
-    """Try to detect total pages from pagination links; fallback to scanning hrefs for /page/N/"""
-    max_page = 1
-    # look for common pagination containers
-    for a in soup.select("a[href]"):
-        href = a['href']
-        m = re.search(r"/page/(\d+)", href)
-        if m:
-            try:
-                p = int(m.group(1))
-                if p > max_page:
-                    max_page = p
-            except:
-                continue
-    # also try text like 'Page 1 of 5'
-    txt = soup.get_text(" ", strip=True)
-    m2 = re.search(r"Page\s*\d+\s*of\s*(\d+)", txt, re.I)
-    if m2:
-        try:
-            p = int(m2.group(1))
-            if p > max_page:
-                max_page = p
-        except:
-            pass
-    # safety cap
-    if max_page > MAX_PAGES_SAFEGUARD:
-        max_page = MAX_PAGES_SAFEGUARD
-    return max_page
+        for row in rows:
+            cols = [c.get_text(strip=True) for c in row.find_all("td")]
+            if len(cols) >= 9:
+                date = cols[0]
+                numbers = cols[1:9]
+                all_results.append([date] + numbers)
 
-def parse_draws_from_page(soup):
-    """
-    Best-effort parse: Lottolyzer draws often have date text and image tags where alt="13".
-    We'll find draw containers (rows or list items) that include both a date and 8 images (alts).
-    Fallback: group sequential img alts into draws of 8.
-    """
-    date_regex = re.compile(r"\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}|\w+\s+\d{1,2},\s*\d{4}")
-    draws = []
+        page += 1
+        time.sleep(0.2)  # be nice to server
 
-    # attempt: find table rows (<tr>) that represent draws
-    for tr in soup.select("tr"):
-        # gather imgs alt numbers in this tr
-        imgs = tr.find_all("img", alt=True)
-        nums = [int(img['alt']) for img in imgs if img.get('alt','').strip().isdigit()]
-        # try to find a date in any td/th text within the tr
-        date_text = None
-        for td in tr.find_all(["td","th"]):
-            t = td.get_text(" ", strip=True)
-            m = date_regex.search(t)
-            if m:
-                date_text = m.group(0)
-                break
-        if nums and len(nums) >= NUMBERS_PER_DRAW:
-            draws.append({"date": date_text, "numbers": nums[:NUMBERS_PER_DRAW]})
-
-    # fallback: look for div/list entries that look like draw containers
-    if not draws:
-        for entry in soup.select("div, li"):
-            imgs = entry.find_all("img", alt=True)
-            nums = [int(img['alt']) for img in imgs if img.get('alt','').strip().isdigit()]
-            if nums and len(nums) >= NUMBERS_PER_DRAW:
-                # find date nearby in entry text
-                t = entry.get_text(" ", strip=True)
-                m = date_regex.search(t)
-                date_text = m.group(0) if m else None
-                draws.append({"date": date_text, "numbers": nums[:NUMBERS_PER_DRAW]})
-
-    # last fallback: gather all image alts on page and group sequentially
-    if not draws:
-        imgs = soup.find_all("img", alt=True)
-        nums = [int(img['alt']) for img in imgs if img.get('alt','').strip().isdigit()]
-        for i in range(0, len(nums), NUMBERS_PER_DRAW):
-            group = nums[i:i+NUMBERS_PER_DRAW]
-            if len(group) == NUMBERS_PER_DRAW:
-                draws.append({"date": None, "numbers": group})
-
-    return draws
-
-def scrape_all_pages():
-    """Scrape all available pages from Lottolyzer, detect page count automatically."""
-    aggregated = []
-    # fetch page 1 first to detect total pages
-    url1 = LOTTOLYZER_PAGE_TEMPLATE.format(1)
-    resp1 = fetch(url1)
-    if resp1.status_code == 403 or resp1.status_code == 429:
-        raise PermissionError(f"Access blocked by remote host (HTTP {resp1.status_code}). Try again later or run locally.")
-    if resp1.status_code != 200:
-        raise RuntimeError(f"Failed to fetch page 1 (HTTP {resp1.status_code})")
-    soup1 = BeautifulSoup(resp1.text, "lxml")
-    total_pages = detect_total_pages(soup1)
-    # safety: if detection fails, default to 1
-    if total_pages < 1:
-        total_pages = 1
-
-    # guard: if total_pages is huge, cap it (safeguard already in detect)
-    total_pages = min(total_pages, MAX_PAGES_SAFEGUARD)
-
-    # parse page1
-    page_draws = parse_draws_from_page(soup1)
-    aggregated.extend(page_draws)
-
-    # iterate remaining pages
-    if total_pages > 1:
-        for p in range(2, total_pages + 1):
-            url = LOTTOLYZER_PAGE_TEMPLATE.format(p)
-            time.sleep(PAUSE_BETWEEN_REQUESTS)
-            resp = fetch(url)
-            if resp.status_code == 403 or resp.status_code == 429:
-                # remote blocked us; fail gracefully and return what we have
-                st.warning(f"Scraping blocked at page {p} (HTTP {resp.status_code}). Returning partial data.")
-                break
-            if resp.status_code != 200:
-                st.warning(f"Failed to fetch page {p} (HTTP {resp.status_code}). Stopping pagination.")
-                break
-            soup = BeautifulSoup(resp.text, "lxml")
-            page_draws = parse_draws_from_page(soup)
-            if not page_draws:
-                # if a page yields nothing, we continue but stop if many consecutive empty pages
-                st.info(f"No draws parsed on page {p}; continuing.")
-            aggregated.extend(page_draws)
-    # deduplicate: some pages might duplicate draws; we remove exact duplicates by date+nums if date exists, else by nums sequence
-    seen = set()
-    unique = []
-    for d in aggregated:
-        key = None
-        if d.get("date"):
-            key = (d["date"], tuple(d["numbers"]))
-        else:
-            key = tuple(d["numbers"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(d)
-    return unique
-
-def draws_to_dataframe(draws):
-    rows = []
-    for d in draws:
-        row = {}
-        # parse/normalize date field to ISO if possible
-        dt = None
-        if d.get("date"):
-            try:
-                dt = pd.to_datetime(d["date"], errors='coerce', dayfirst=False, infer_datetime_format=True)
-            except:
-                dt = None
-        row['date'] = dt
-        for i in range(NUMBERS_PER_DRAW):
-            row[f"n{i+1}"] = d["numbers"][i]
-        rows.append(row)
-    df = pd.DataFrame(rows)
-    # if date column exists, sort descending by date (put NaT at bottom)
-    if 'date' in df.columns:
-        df = df.sort_values(by='date', ascending=False, na_position='last').reset_index(drop=True)
+    df = pd.DataFrame(all_results, columns=["date"] + [f"num{i}" for i in range(1, 9)])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date", ascending=False).reset_index(drop=True)
     return df
 
-def build_frequency(df):
-    all_nums = []
-    for i in range(1, NUMBERS_PER_DRAW+1):
-        col = f"n{i}"
-        if col in df.columns:
-            all_nums.extend(df[col].dropna().astype(int).tolist())
-    cnt = Counter(all_nums)
-    freq_list = [(n, cnt.get(n, 0)) for n in range(1, TOTAL_NUMBERS+1)]
-    freq_df = pd.DataFrame(freq_list, columns=["Number", "Frequency"]).sort_values(by="Frequency", ascending=False).reset_index(drop=True)
-    return freq_df
+# --- Prediction function ---
+def predict_numbers(df, top_n=3):
+    nums = df[[f"num{i}" for i in range(1, 8)]].values.flatten()
+    nums = [int(n) for n in nums if n.isdigit()]
+    freq = Counter(nums)
+    top_nums = [n for n, _ in freq.most_common(8)]
+    predictions = [sorted(random.sample(top_nums, 8)) for _ in range(top_n)]
+    return predictions
 
-def top3_sets_from_freq(freq_df):
-    top24 = freq_df['Number'].tolist()[:24]
-    sets = []
-    for i in range(3):
-        subset = sorted(top24[i*8:(i+1)*8])
-        sets.append(subset)
-    return sets
+# --- Quick Picks ---
+def quick_picks(top_n=3):
+    picks = []
+    for _ in range(top_n):
+        pick = sorted(random.sample(range(1, 38), 8))
+        picks.append(pick)
+    return picks
 
-def render_ticket(numbers, hot_set=None):
-    """Return HTML for two rows x 4 columns ticket style. hot_set is a set of numbers to highlight."""
-    hot_set = hot_set or set()
-    def badge(n):
-        if n in hot_set:
-            return f"<span style='display:inline-block;margin:4px;padding:8px 12px;background:#ffecec;color:#b30000;font-weight:700;border-radius:6px'>{n}</span>"
-        else:
-            return f"<span style='display:inline-block;margin:4px;padding:8px 12px;background:#eef6ff;color:#0a3f6b;border-radius:6px'>{n}</span>"
-    row1 = " ".join(badge(n) for n in numbers[:4])
-    row2 = " ".join(badge(n) for n in numbers[4:8])
-    html = f"<div style='padding:6px 0'>{row1}<br>{row2}</div>"
-    return html
+# --- Streamlit UI ---
+st.set_page_config(page_title="Magnum Life Predictor", layout="wide")
 
-# ---------- Main flow ----------
-st.markdown("**Status:** scraping full history from Lottolyzer (may take a few seconds).")
-try:
-    all_draws_raw = scrape_all_pages()
-    if not all_draws_raw:
-        st.error("No draws parsed. The source may have changed or blocked scraping.")
-        st.stop()
-except PermissionError as pe:
-    st.error(str(pe))
-    st.stop()
-except Exception as e:
-    st.error(f"Unexpected scraping error: {e}")
-    st.stop()
+st.title("🎯 Magnum Life Prediction (Malaysia)")
+st.write("This app predicts Magnum Life numbers based on historical data.")
 
-# Convert to DataFrame
-df = draws_to_dataframe(all_draws_raw)
+with st.spinner("Scraping past results..."):
+    df_results = scrape_results()
 
-# Build frequency & predictions
-freq_df = build_frequency(df)
-top3_sets = top3_sets_from_freq(freq_df)
-hot_numbers = set(freq_df['Number'].tolist()[:8])
+# --- Predictions ---
+st.subheader("🔮 Top 3 Predictions")
+preds = predict_numbers(df_results, top_n=3)
+for i, p in enumerate(preds, start=1):
+    st.write(f"**Prediction {i}:**", ", ".join(str(x) for x in p))
 
-# Layout: Tabs
-tab_pred, tab_past, tab_freq = st.tabs(["Predictions", "Past Results", "Frequency Graph"])
+# --- Quick Picks ---
+st.subheader("🎲 Quick Picks (Random)")
+quick = quick_picks(top_n=3)
+for i, q in enumerate(quick, start=1):
+    st.write(f"**Quick Pick {i}:**", ", ".join(str(x) for x in q))
 
-with tab_pred:
-    st.header("Top 3 Predicted Sets (unchanged algorithm)")
-    st.write(f"*Based on {len(df)} draws scraped*")
-    for idx, s in enumerate(top3_sets, start=1):
-        html = render_ticket(s, hot_set=hot_numbers)
-        st.markdown(f"**Set {idx}**", unsafe_allow_html=False)
-        st.markdown(html, unsafe_allow_html=True)
-    st.markdown("---")
-    st.subheader("Quick Picks (3 randomized sets, same layout)")
-    for i in range(3):
-        q = sorted(random.sample(range(1, TOTAL_NUMBERS+1), NUMBERS_PER_DRAW))
-        html = render_ticket(q, hot_set=hot_numbers)
-        st.markdown(f"Quick {i+1}", unsafe_allow_html=False)
-        st.markdown(html, unsafe_allow_html=True)
+# --- Past Results ---
+with st.expander("📜 View Full Past Results"):
+    st.dataframe(df_results)
 
-with tab_past:
-    st.header("Past Draws (collapsed by default)")
-    with st.expander("Show full past draws (click to expand)", expanded=False):
-        # show date and eight numbers as columns (n1..n8)
-        display_df = df.copy()
-        # format date nicely
-        if 'date' in display_df.columns:
-            display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
-        # reorder to date, n1..n8
-        cols = ['date'] + [f"n{i}" for i in range(1, NUMBERS_PER_DRAW+1) if f"n{i}" in display_df.columns]
-        st.dataframe(display_df[cols], use_container_width=True)
-        # Also render a few rows in ticket style for quick visual check
-        st.markdown("### Visual (first 25 draws):")
-        for _, row in display_df.head(25).iterrows():
-            d = row.get('date') if 'date' in row.index else ''
-            nums = [int(row[f"n{i}"]) for i in range(1, NUMBERS_PER_DRAW+1)]
-            html = f"<strong>{d}</strong><br>" + render_ticket(nums, hot_set=hot_numbers)
-            st.markdown(html, unsafe_allow_html=True)
+# --- Graph ---
+st.subheader("📊 Number Frequency")
+all_nums = df_results[[f"num{i}" for i in range(1, 9)]].values.flatten()
+all_nums = [int(n) for n in all_nums if str(n).isdigit()]
+freq_df = pd.DataFrame(Counter(all_nums).items(), columns=["Number", "Frequency"]).sort_values("Frequency", ascending=False)
+st.bar_chart(freq_df.set_index("Number"))
 
-with tab_freq:
-    st.header("Frequency Graph")
-    st.write("Numbers sorted by historical frequency (higher = hotter)")
-    # plot with streamlit native altair or plotly
-    try:
-        import plotly.express as px
-        fig = px.bar(freq_df, x='Number', y='Frequency', title='Number Frequency', labels={'Frequency':'Count'})
-        st.plotly_chart(fig, use_container_width=True)
-    except Exception:
-        st.dataframe(freq_df)
-
-st.success("Done — full history scraped and analyzed.")
+st.success(f"✅ Data loaded: {len(df_results)} draws")
