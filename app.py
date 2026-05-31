@@ -1,14 +1,3 @@
-# ============================================================
-#  Magnum Life AI Predictor — Streamlit App
-#  Fixed for: Python 3.13 + Pandas 3.x + Streamlit 1.58
-#
-#  FIXES APPLIED:
-#  1. Removed infer_datetime_format (dropped in Pandas 2.0)
-#  2. Added anthropic to requirements.txt
-#  3. Single AI call (no rate limit 429)
-#  4. Robust JSON extraction
-# ============================================================
-
 import streamlit as st
 import anthropic
 import requests
