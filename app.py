@@ -1,213 +1,205 @@
-# app.py
-import os
-import io
-import re
-import time
-import random
+import os, io, re, time, random, json, itertools
 from datetime import datetime, timedelta
-from collections import Counter
+from collections import Counter, defaultdict
 
 import requests
 import pandas as pd
 import numpy as np
 from bs4 import BeautifulSoup
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh   # pip install streamlit-autorefresh
 
-# ===========================
+# ───────────────────────────────────────────────
 # Config
-# ===========================
-st.set_page_config(page_title="Magnum Life Dashboard", layout="wide")
-st.title("🎯 Magnum Life Prediction Dashboard")
+# ───────────────────────────────────────────────
+st.set_page_config(page_title="Magnum Life AI Dashboard", layout="wide")
+st.title("🎯 Magnum Life — Full AI Prediction Dashboard")
 
-LAST_PAGE = 24
-BASE_URL = "https://en.lottolyzer.com/history/malaysia/magnum-life/page/{}/per-page/50/number-view"
-HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/115.0.0.0 Safari/537.36")
-}
-REQUEST_TIMEOUT = 20
-PAUSE_BETWEEN_PAGE_REQUESTS = 0.35
+LAST_PAGE            = 24
+BASE_URL             = ("https://en.lottolyzer.com/history/malaysia/magnum-life"
+                        "/page/{}/per-page/50/number-view")
+HEADERS              = {"User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/115.0.0.0 Safari/537.36")}
+REQUEST_TIMEOUT      = 20
+PAUSE_BETWEEN_PAGES  = 0.35
 
-NUMBERS_PER_DRAW = 8
-TOTAL_NUMBERS = 36
+NUMBERS_PER_DRAW     = 8
+TOTAL_NUMBERS        = 36
 
-CACHE_FILENAME = "past_results.csv"
-CACHE_MAX_AGE_HOURS = 24
+CACHE_FILENAME       = "past_results.csv"
+FEEDBACK_FILENAME    = "feedback_weights.json"
+CACHE_MAX_AGE_HOURS  = 6      # shorter = more live
 
-DEFAULT_PREDICTION_COUNT = 3
-DEFAULT_DECAY_HALFLIFE_DRAWS = 60
+DEFAULT_PRED_COUNT   = 3
+DEFAULT_HALF_LIFE    = 60
+DEFAULT_W_RECENCY    = 40
+DEFAULT_W_GAP        = 20
+DEFAULT_W_COOCCUR    = 20
+DEFAULT_W_TREND      = 20
+MONTE_CARLO_RUNS     = 10_000
+AUTOREFRESH_MINS     = 30
 
-# ===========================
-# Helpers: cache
-# ===========================
+ANTHROPIC_API_URL    = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL         = "claude-sonnet-4-20250514"
+
+# ───────────────────────────────────────────────
+# Cache helpers
+# ───────────────────────────────────────────────
 def is_cache_fresh(path=CACHE_FILENAME, max_age_hours=CACHE_MAX_AGE_HOURS) -> bool:
     if not os.path.exists(path):
         return False
-    mtime = os.path.getmtime(path)
-    age = datetime.now() - datetime.fromtimestamp(mtime)
+    age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(path))
     return age < timedelta(hours=max_age_hours)
-
 
 def save_cache(df: pd.DataFrame, path=CACHE_FILENAME):
     df.to_csv(path, index=False)
 
-
 def load_cache(path=CACHE_FILENAME) -> pd.DataFrame:
-    return pd.read_csv(path, parse_dates=['date'], dayfirst=True)
+    return pd.read_csv(path, parse_dates=["date"], dayfirst=True)
 
+# ───────────────────────────────────────────────
+# Adaptive feedback
+# ───────────────────────────────────────────────
+def load_feedback(path=FEEDBACK_FILENAME) -> dict:
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {str(n): 0.0 for n in range(1, TOTAL_NUMBERS + 1)}
 
-# ===========================
-# Scraper (robust)
-# ===========================
+def save_feedback(fb: dict, path=FEEDBACK_FILENAME):
+    with open(path, "w") as f:
+        json.dump(fb, f)
+
+def apply_feedback_from_draw(fb: dict, predicted: list, actual: list,
+                              lr: float = 0.05) -> dict:
+    pred_set, actual_set = set(predicted), set(actual)
+    fb = dict(fb)
+    for n in range(1, TOTAL_NUMBERS + 1):
+        key = str(n)
+        if n in pred_set and n not in actual_set:
+            fb[key] = fb.get(key, 0.0) - lr
+        elif n in actual_set and n not in pred_set:
+            fb[key] = fb.get(key, 0.0) + lr
+        elif n in pred_set and n in actual_set:
+            fb[key] = fb.get(key, 0.0) + lr * 0.3
+        fb[key] = max(-1.0, min(1.0, fb[key]))
+    return fb
+
+# ───────────────────────────────────────────────
+# Scraper
+# ───────────────────────────────────────────────
 DATE_REGEX = re.compile(
-    r'(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}|'
-    r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s*\d{4}|'
-    r'\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})',
-    re.I
+    r"(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}|"
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s*\d{4}|"
+    r"\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})",
+    re.I,
 )
 
-
-def _parse_row_for_numbers(tr):
+def _parse_numbers(tr):
     nums = []
-    # Strategy A: image alt
     for img in tr.find_all("img", alt=True):
         alt = (img.get("alt") or "").strip()
         if alt.isdigit():
             n = int(alt)
             if 1 <= n <= TOTAL_NUMBERS:
                 nums.append(n)
-    # Strategy B: class names with number/ball tokens
     if len(nums) < NUMBERS_PER_DRAW:
         for td in tr.find_all(["td", "div", "span"]):
-            classes = " ".join(td.get("class", [])) if td.get("class") else ""
-            if any(k in classes.lower() for k in ["number", "num", "ball"]):
-                txt = td.get_text(" ", strip=True)
-                for token in re.findall(r"\b\d{1,2}\b", txt):
-                    n = int(token)
+            cls = " ".join(td.get("class", []))
+            if any(k in cls.lower() for k in ["number", "num", "ball"]):
+                for tok in re.findall(r"\b\d{1,2}\b", td.get_text(" ", strip=True)):
+                    n = int(tok)
                     if 1 <= n <= TOTAL_NUMBERS:
                         nums.append(n)
                         if len(nums) == NUMBERS_PER_DRAW:
                             break
             if len(nums) == NUMBERS_PER_DRAW:
                 break
-    # Strategy C: any digits in row
     if len(nums) < NUMBERS_PER_DRAW:
-        txt = tr.get_text(" ", strip=True)
-        for token in re.findall(r"\b\d{1,2}\b", txt):
-            n = int(token)
+        for tok in re.findall(r"\b\d{1,2}\b", tr.get_text(" ", strip=True)):
+            n = int(tok)
             if 1 <= n <= TOTAL_NUMBERS:
                 nums.append(n)
                 if len(nums) == NUMBERS_PER_DRAW:
                     break
     return nums[:NUMBERS_PER_DRAW]
 
-
-def _parse_row_for_date(tr):
+def _parse_date(tr):
     tds = tr.find_all(["td", "div", "span"])
     if tds:
-        txt0 = tds[0].get_text(" ", strip=True)
-        m0 = DATE_REGEX.search(txt0)
-        if m0:
-            return m0.group(0)
+        m = DATE_REGEX.search(tds[0].get_text(" ", strip=True))
+        if m:
+            return m.group(0)
     m = DATE_REGEX.search(tr.get_text(" ", strip=True))
     return m.group(0) if m else None
 
-
-def _fallback_grouping_from_images(soup):
-    rows = []
-    imgs = soup.find_all("img", alt=lambda a: a and a.strip().isdigit())
-    digits = [int(img['alt'].strip()) for img in imgs if img.get('alt', '').strip().isdigit()]
+def _fallback(soup):
+    rows, imgs = [], soup.find_all("img", alt=lambda a: a and a.strip().isdigit())
+    digits = [int(img["alt"].strip()) for img in imgs]
     for i in range(0, len(digits), NUMBERS_PER_DRAW):
-        group = digits[i:i + NUMBERS_PER_DRAW]
-        if len(group) == NUMBERS_PER_DRAW:
-            rows.append({
-                "date": None,
-                **{f"n{j+1}": group[j] for j in range(NUMBERS_PER_DRAW)}
-            })
+        g = digits[i:i + NUMBERS_PER_DRAW]
+        if len(g) == NUMBERS_PER_DRAW:
+            rows.append({"date": None, **{f"n{j+1}": g[j] for j in range(NUMBERS_PER_DRAW)}})
     return rows
 
-
 def scrape_all_history(last_page: int = LAST_PAGE) -> pd.DataFrame:
-    rows = []
-    seen = set()
+    rows, seen = [], set()
     for page in range(1, last_page + 1):
         url = BASE_URL.format(page)
         try:
             resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         except Exception:
-            time.sleep(PAUSE_BETWEEN_PAGE_REQUESTS)
-            continue
+            time.sleep(PAUSE_BETWEEN_PAGES); continue
         if resp.status_code != 200:
-            time.sleep(PAUSE_BETWEEN_PAGE_REQUESTS)
-            continue
-
+            time.sleep(PAUSE_BETWEEN_PAGES); continue
         soup = BeautifulSoup(resp.text, "lxml")
-        trs = soup.select("table tbody tr")
-        if not trs:
-            trs = soup.find_all("tr")
-
+        trs  = soup.select("table tbody tr") or soup.find_all("tr")
         page_new = 0
         for tr in trs:
-            nums = _parse_row_for_numbers(tr)
+            nums = _parse_numbers(tr)
             if len(nums) != NUMBERS_PER_DRAW:
                 continue
-            date_text = _parse_row_for_date(tr)
-            d = {'date': date_text}
-            for i, n in enumerate(nums, start=1):
-                d[f"n{i}"] = n
-            key = (date_text, tuple(nums)) if date_text else tuple(nums)
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append(d)
-            page_new += 1
-
+            d   = {"date": _parse_date(tr), **{f"n{i+1}": nums[i] for i in range(NUMBERS_PER_DRAW)}}
+            key = (d["date"], tuple(nums)) if d["date"] else tuple(nums)
+            if key in seen: continue
+            seen.add(key); rows.append(d); page_new += 1
         if page_new == 0:
-            fallback_rows = _fallback_grouping_from_images(soup)
-            for d in fallback_rows:
-                key = (d.get('date'), tuple(d[f"n{i}"] for i in range(1, NUMBERS_PER_DRAW + 1)))
-                if key in seen:
-                    continue
-                seen.add(key)
-                rows.append(d)
-                page_new += 1
-
+            for d in _fallback(soup):
+                key = (d.get("date"), tuple(d[f"n{i}"] for i in range(1, NUMBERS_PER_DRAW + 1)))
+                if key in seen: continue
+                seen.add(key); rows.append(d); page_new += 1
         if page_new == 0:
             break
-
-        time.sleep(PAUSE_BETWEEN_PAGE_REQUESTS)
-
+        time.sleep(PAUSE_BETWEEN_PAGES)
     if not rows:
-        return pd.DataFrame(columns=['date'] + [f"n{i}" for i in range(1, NUMBERS_PER_DRAW + 1)])
-
+        return pd.DataFrame(columns=["date"] + [f"n{i}" for i in range(1, NUMBERS_PER_DRAW + 1)])
     df = pd.DataFrame(rows)
-
-    if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'], errors='coerce', dayfirst=True, infer_datetime_format=True)
-
-    df = df.sort_values(by='date', ascending=False, na_position='last').reset_index(drop=True)
-
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True, infer_datetime_format=True)
+    df = df.sort_values("date", ascending=False, na_position="last").reset_index(drop=True)
     for i in range(1, NUMBERS_PER_DRAW + 1):
         col = f"n{i}"
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
-
-    df = df.drop_duplicates(subset=['date'] + [f"n{i}" for i in range(1, NUMBERS_PER_DRAW + 1)],
-                            keep='first').reset_index(drop=True)
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+    df = df.drop_duplicates(
+        subset=["date"] + [f"n{i}" for i in range(1, NUMBERS_PER_DRAW + 1)],
+        keep="first").reset_index(drop=True)
     return df
 
-
-# ===========================
-# Analytics / Prediction
-# ===========================
-def weighted_frequency(df: pd.DataFrame, half_life_draws: int) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=['Number', 'Weight', 'Rank'])
-    ages = np.arange(len(df))
-    weights = 0.5 ** (ages / max(1, half_life_draws))
-    scores = {n: 0.0 for n in range(1, TOTAL_NUMBERS + 1)}
+# ───────────────────────────────────────────────
+# Analytics Signals
+# ───────────────────────────────────────────────
+def recency_scores(df, half_life):
+    scores = np.zeros(TOTAL_NUMBERS + 1)
+    if df.empty: return scores
+    weights = 0.5 ** (np.arange(len(df)) / max(1, half_life))
     for idx, w in enumerate(weights):
         row = df.iloc[idx]
         for i in range(1, NUMBERS_PER_DRAW + 1):
@@ -216,216 +208,323 @@ def weighted_frequency(df: pd.DataFrame, half_life_draws: int) -> pd.DataFrame:
                 v = int(val)
                 if 1 <= v <= TOTAL_NUMBERS:
                     scores[v] += w
-    wf = pd.DataFrame(sorted(scores.items(), key=lambda x: x[1], reverse=True),
-                      columns=['Number', 'Weight'])
-    wf['Rank'] = np.arange(1, len(wf) + 1)
-    return wf
+    return scores
 
+def gap_scores(df):
+    scores   = np.zeros(TOTAL_NUMBERS + 1)
+    last_seen = {n: None for n in range(1, TOTAL_NUMBERS + 1)}
+    for idx in range(len(df)):
+        row = df.iloc[idx]
+        for i in range(1, NUMBERS_PER_DRAW + 1):
+            val = row.get(f"n{i}")
+            if pd.notna(val):
+                v = int(val)
+                if 1 <= v <= TOTAL_NUMBERS and last_seen[v] is None:
+                    last_seen[v] = idx
+    n_draws = max(len(df), 1)
+    for num in range(1, TOTAL_NUMBERS + 1):
+        ls = last_seen[num]
+        scores[num] = n_draws if ls is None else ls
+    mx = scores[1:].max()
+    if mx > 0: scores[1:] /= mx
+    return scores
 
-def generate_predictions(wfreq: pd.DataFrame, count: int) -> list:
-    if wfreq.empty or wfreq['Weight'].sum() <= 0:
-        return [sorted(random.sample(range(1, TOTAL_NUMBERS + 1), NUMBERS_PER_DRAW)) for _ in range(count)]
-    numbers = wfreq['Number'].to_numpy()
-    probs = wfreq['Weight'].to_numpy()
-    probs = probs / probs.sum()
-    preds = []
-    preds.append(sorted(numbers[:NUMBERS_PER_DRAW].tolist()))
+def cooccurrence_matrix(df):
+    co = np.zeros((TOTAL_NUMBERS + 1, TOTAL_NUMBERS + 1))
+    for idx in range(len(df)):
+        row  = df.iloc[idx]
+        nums = []
+        for i in range(1, NUMBERS_PER_DRAW + 1):
+            val = row.get(f"n{i}")
+            if pd.notna(val):
+                v = int(val)
+                if 1 <= v <= TOTAL_NUMBERS:
+                    nums.append(v)
+        for a in nums:
+            for b in nums:
+                if a != b:
+                    co[a][b] += 1
+    row_sums = co.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    return co / row_sums
+
+def sequence_trend_scores(df, window=30):
+    scores = np.zeros(TOTAL_NUMBERS + 1)
+    n = min(window, len(df))
+    if n < 3: return scores
+    recent = df.iloc[:n]
+    x = np.arange(n, dtype=float)
+    for num in range(1, TOTAL_NUMBERS + 1):
+        series = np.zeros(n)
+        for idx in range(n):
+            row = recent.iloc[idx]
+            for i in range(1, NUMBERS_PER_DRAW + 1):
+                val = row.get(f"n{i}")
+                if pd.notna(val) and int(val) == num:
+                    series[idx] = 1; break
+        series = series[::-1]
+        scores[num] = np.polyfit(x, series, 1)[0]
+    min_s = scores[1:].min()
+    scores[1:] -= min_s
+    mx = scores[1:].max()
+    if mx > 0: scores[1:] /= mx
+    return scores
+
+def feedback_scores(fb):
+    scores = np.zeros(TOTAL_NUMBERS + 1)
+    for num in range(1, TOTAL_NUMBERS + 1):
+        scores[num] = (fb.get(str(num), 0.0) + 1.0) / 2.0
+    return scores
+
+# ── Phase 2: Triplet hotspots ──────────────────
+def triplet_hotspots(df, top_n=10) -> list:
+    """Returns top_n most common number triplets across all draws."""
+    counter = Counter()
+    for idx in range(len(df)):
+        row  = df.iloc[idx]
+        nums = []
+        for i in range(1, NUMBERS_PER_DRAW + 1):
+            val = row.get(f"n{i}")
+            if pd.notna(val):
+                v = int(val)
+                if 1 <= v <= TOTAL_NUMBERS:
+                    nums.append(v)
+        for triplet in itertools.combinations(sorted(nums), 3):
+            counter[triplet] += 1
+    return counter.most_common(top_n)
+
+def triplet_score_array(df) -> np.ndarray:
+    """Score each number by how often it appears in hot triplets."""
+    scores = np.zeros(TOTAL_NUMBERS + 1)
+    for triplet, count in triplet_hotspots(df, top_n=50):
+        for n in triplet:
+            scores[n] += count
+    mx = scores[1:].max()
+    if mx > 0: scores[1:] /= mx
+    return scores
+
+# ── Ensemble ───────────────────────────────────
+def ensemble_scores(df, half_life, w_rec, w_gap, w_trend, w_coo, w_triplet, fb):
+    s_rec  = recency_scores(df, half_life)
+    s_gap  = gap_scores(df)
+    s_tre  = sequence_trend_scores(df, window=30)
+    s_fdb  = feedback_scores(fb)
+    s_tri  = triplet_score_array(df)
+    co     = cooccurrence_matrix(df)
+
+    def norm(a):
+        mx = a[1:].max()
+        if mx > 0:
+            a = a.copy(); a[1:] /= mx
+        return a
+
+    s_rec = norm(s_rec)
+    s_coo = norm(np.array([0.0] + [co[n][1:].mean() for n in range(1, TOTAL_NUMBERS+1)]))
+
+    total_w = w_rec + w_gap + w_trend + w_coo + w_triplet
+    if total_w <= 0: total_w = 1.0
+
+    combined = (
+        w_rec     / total_w * s_rec  +
+        w_gap     / total_w * s_gap  +
+        w_trend   / total_w * s_tre  +
+        w_coo     / total_w * s_coo  +
+        w_triplet / total_w * s_tri
+    )
+    fb_mod = 0.5 + (s_fdb - 0.5) * 0.4
+    combined[1:] *= fb_mod[1:]
+    return combined, co
+
+# ── Phase 2: Monte Carlo simulation ───────────────
+def monte_carlo_predictions(scores, n_runs=MONTE_CARLO_RUNS) -> pd.DataFrame:
+    """
+    Simulate n_runs draws by sampling WITHOUT replacement using ensemble scores as probs.
+    Returns frequency table of how often each combination of 8 appears.
+    Also returns the top consensus 8 numbers (most frequently drawn across all sims).
+    """
+    numbers   = np.arange(1, TOTAL_NUMBERS + 1)
+    probs     = scores[1:].copy()
+    probs     = np.clip(probs, 0, None)
+    if probs.sum() <= 0: probs = np.ones(TOTAL_NUMBERS)
+    probs    /= probs.sum()
+
+    tally = np.zeros(TOTAL_NUMBERS + 1, dtype=int)
+    for _ in range(n_runs):
+        draw = np.random.choice(numbers, size=NUMBERS_PER_DRAW, replace=False, p=probs)
+        for n in draw:
+            tally[n] += 1
+
+    mc_df = pd.DataFrame({
+        "Number":    numbers,
+        "SimCount":  tally[1:],
+        "SimPct":    (tally[1:] / n_runs * 100).round(2),
+    }).sort_values("SimCount", ascending=False).reset_index(drop=True)
+
+    consensus = sorted(mc_df.head(NUMBERS_PER_DRAW)["Number"].tolist())
+    return mc_df, consensus
+
+# ── Phase 2: Wheeling system ────────────────────
+def generate_wheel(pool: list, guarantee: int = 3) -> list:
+    """
+    Abbreviated wheeling: generate a minimum set of tickets from `pool`
+    such that any `guarantee` numbers from the pool appear together
+    in at least one ticket.
+    Uses a greedy cover approach — practical for pool sizes ≤ 12.
+    Returns list of tickets (each = list of NUMBERS_PER_DRAW numbers).
+    """
+    pool    = sorted(pool)
+    needed  = list(itertools.combinations(pool, guarantee))
+    covered = set()
+    tickets = []
+
+    while len(covered) < len(needed):
+        # pick the combination of NUMBERS_PER_DRAW numbers that covers most uncovered triplets
+        candidates = list(itertools.combinations(pool, NUMBERS_PER_DRAW))
+        random.shuffle(candidates)
+        best_ticket, best_cover = None, set()
+        for cand in candidates:
+            cand_set = set(cand)
+            new_cover = {t for t in needed if t not in covered and set(t).issubset(cand_set)}
+            if len(new_cover) > len(best_cover):
+                best_cover  = new_cover
+                best_ticket = cand
+            if len(best_cover) == len(needed) - len(covered):
+                break
+        if best_ticket is None:
+            break
+        tickets.append(list(best_ticket))
+        covered |= best_cover
+
+    return tickets
+
+# ── Prediction generation ──────────────────────
+def generate_predictions(scores, co, count):
+    numbers    = np.arange(1, TOTAL_NUMBERS + 1)
+    base_probs = np.clip(scores[1:], 0, None)
+    if base_probs.sum() <= 0: base_probs = np.ones(TOTAL_NUMBERS)
+    base_probs /= base_probs.sum()
+
+    preds = [sorted(numbers[np.argsort(base_probs)[-NUMBERS_PER_DRAW:]].tolist())]
+
     for _ in range(1, count):
-        chosen = []
-        mask = np.ones_like(numbers, dtype=bool)
-        for _pick in range(NUMBERS_PER_DRAW):
-            avail_nums = numbers[mask]
-            avail_probs = probs[mask]
-            avail_probs = avail_probs / avail_probs.sum()
-            pick = int(np.random.choice(avail_nums, p=avail_probs))
+        probs     = base_probs.copy()
+        chosen    = []
+        available = set(range(1, TOTAL_NUMBERS + 1))
+        for _ in range(NUMBERS_PER_DRAW):
+            avail_idx  = np.array(sorted(available)) - 1
+            avail_prob = np.clip(probs[avail_idx], 0, None)
+            if avail_prob.sum() <= 0: avail_prob = np.ones(len(avail_idx))
+            avail_prob /= avail_prob.sum()
+            pick = int(np.random.choice(numbers[avail_idx], p=avail_prob))
             chosen.append(pick)
-            mask[np.where(numbers == pick)[0][0]] = False
+            available.remove(pick)
+            for n in list(available):
+                probs[n - 1] *= (1 + co[pick][n] * 0.5)
         preds.append(sorted(chosen))
     return preds
 
-
-def closeness_overlap_pct(pred: list, actual: list) -> float:
+# ── Metrics ────────────────────────────────────
+def overlap_pct(pred, actual):
     return 100.0 * len(set(pred) & set(actual)) / NUMBERS_PER_DRAW
 
+def distance_score(pred, actual):
+    if not pred or not actual: return 0.0
+    dists = [min(abs(p - a) for a in actual) for p in pred]
+    return max(0.0, 100.0 * (1.0 - np.mean(dists) / (TOTAL_NUMBERS / 2.0)))
 
-def avg_min_distance_score(pred: list, actual: list) -> float:
-    if not pred or not actual:
-        return 0.0
-    dists = []
-    for p in pred:
-        dists.append(min(abs(p - a) for a in actual))
-    avg_d = float(np.mean(dists)) if dists else (TOTAL_NUMBERS / 2.0)
-    norm = (TOTAL_NUMBERS / 2.0)
-    return max(0.0, 100.0 * (1.0 - (avg_d / norm)))
+def position_match(pred, actual):
+    return 100.0 * sum(1 for p, a in zip(pred, actual) if p == a) / NUMBERS_PER_DRAW
 
-
-def position_match_pct(pred: list, actual: list) -> float:
-    same = sum(1 for p, a in zip(pred, actual) if p == a)
-    return 100.0 * same / NUMBERS_PER_DRAW
-
-
-def render_badge(n: int, hot: set) -> str:
-    style = "display:inline-block;margin:3px;padding:6px 10px;border-radius:8px;white-space:nowrap;"
+def render_badge(n, hot):
+    s = "display:inline-block;margin:3px;padding:6px 12px;border-radius:8px;font-size:1rem;font-weight:700;"
     if n in hot:
-        return f"<span style='{style}background:#ffecec;color:#b30000;font-weight:700'>{n}</span>"
-    return f"<span style='{style}background:#eef6ff;color:#0a3f6b'>{n}</span>"
+        return f"<span style='{s}background:#ffecec;color:#b30000;border:1px solid #ffb3b3'>{n}</span>"
+    return f"<span style='{s}background:#eef6ff;color:#0a3f6b;border:1px solid #b3d4ff'>{n}</span>"
 
+# ── Phase 2: Claude AI Analyst ─────────────────
+def call_claude_analyst(df, scores, predictions, mc_consensus,
+                        triplets, backtest_rows, signal_summary) -> str:
+    """
+    Sends a rich context prompt to Claude and returns its narrative analysis.
+    """
+    recent_draws = []
+    for i in range(min(10, len(df))):
+        row  = df.iloc[i]
+        nums = [int(row[f"n{j}"]) for j in range(1, NUMBERS_PER_DRAW + 1) if pd.notna(row.get(f"n{j}"))]
+        date = row["date"].strftime("%Y-%m-%d") if pd.notna(row.get("date")) else "?"
+        recent_draws.append(f"  {date}: {nums}")
 
-# ===========================
-# Sidebar controls
-# ===========================
-with st.sidebar:
-    st.subheader("Data & Model Settings")
-    force_rescrape = st.button("🔄 Force re-scrape now")
-    decay = st.slider("Recency half-life (draws)", min_value=10, max_value=200,
-                      value=DEFAULT_DECAY_HALFLIFE_DRAWS, step=5)
-    pred_count = st.slider("Number of prediction sets", min_value=1, max_value=10,
-                           value=DEFAULT_PREDICTION_COUNT, step=1)
+    top_triplets = [f"  {list(t)}: appeared {c} times" for t, c in triplets[:5]]
+    bt_summary   = ""
+    if backtest_rows:
+        avg_ov = np.mean([r["Overlap %"] for r in backtest_rows])
+        bt_summary = f"Average backtest overlap (last 20 draws): {avg_ov:.1f}%"
 
-# ===========================
-# Data loading
-# ===========================
-st.info("Loading past results (cache-aware)…")
+    prompt = f"""You are an expert lottery data analyst for Malaysia's Magnum Life lottery (pick 8 from 1–36).
 
-df = None
-if not force_rescrape and is_cache_fresh():
+You have access to the following statistical analysis of {len(df)} historical draws:
+
+TOP ENSEMBLE SCORES (top 12 numbers):
+{signal_summary}
+
+RECENT 10 DRAWS:
+{chr(10).join(recent_draws)}
+
+TOP NUMBER TRIPLETS (most co-appearing):
+{chr(10).join(top_triplets)}
+
+STATISTICAL PREDICTION SET 1 (deterministic top-weighted):
+{predictions[0]}
+
+MONTE CARLO CONSENSUS (10,000 simulations):
+{mc_consensus}
+
+BACKTEST PERFORMANCE:
+{bt_summary}
+
+Based on all this data, provide:
+1. A brief analysis of the current number landscape (2–3 sentences)
+2. Your AI-reasoned recommended set of 8 numbers with justification for each
+3. Two alternative sets of 8 numbers for coverage diversity
+4. A confidence note (honest assessment, 2–3 sentences)
+5. One key insight from the triplet or co-occurrence patterns
+
+Be analytical, specific, and honest about the limitations of lottery prediction.
+Format your response clearly with headers."""
+
     try:
-        df = load_cache()
-        st.success(f"Loaded past results from cache ({len(df)} draws).")
-    except Exception:
-        df = None
+        resp = requests.post(
+            ANTHROPIC_API_URL,
+            headers={"Content-Type": "application/json"},
+            json={
+                "model":      CLAUDE_MODEL,
+                "max_tokens": 1200,
+                "messages":   [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return "".join(
+                block.get("text", "")
+                for block in data.get("content", [])
+                if block.get("type") == "text"
+            )
+        else:
+            return f"⚠️ Claude API error {resp.status_code}: {resp.text[:300]}"
+    except Exception as e:
+        return f"⚠️ Could not reach Claude API: {e}"
 
-if df is None or force_rescrape:
-    with st.spinner("Scraping all 24 pages from Lottolyzer…"):
-        df = scrape_all_history(last_page=LAST_PAGE)
-        if df.empty:
-            st.error("Unable to parse any draws from Lottolyzer. Please try again later.")
-            st.stop()
-        save_cache(df)
-        st.success(f"Scraped {len(df)} draws and cached.")
-else:
-    if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'], errors='coerce', dayfirst=True)
+# ───────────────────────────────────────────────
+# Sidebar
+# ───────────────────────────────────────────────
+with st.sidebar:
+    st.subheader("⚙️ Data Settings")
+    force_rescrape  = st.button("🔄 Force re-scrape now")
+    auto_refresh_on = st.checkbox(f"⏱ Auto-refresh every {AUTOREFRESH_MINS} min", value=False)
+    decay           = st.slider("Recency half-life (draws)", 10, 200, DEFAULT_HALF_LIFE, 5)
+    pred_count      = st.slider("Prediction sets", 1, 10, DEFAULT_PRED_COUNT, 1)
 
-# ===========================
-# Analytics & Predictions
-# ===========================
-wfreq = weighted_frequency(df, half_life_draws=decay)
-hot_numbers = set(wfreq['Number'].head(8).tolist())
-predictions = generate_predictions(wfreq, count=pred_count)
-
-# ===========================
-# Layout: Tabs
-# ===========================
-tab_pred, tab_compare, tab_past, tab_freq = st.tabs([
-    "Predictions", "Actual vs Predicted", "Past Results", "Frequency Graphs"
-])
-
-with tab_pred:
-    st.header("Dynamic Predictions (recency-weighted)")
-    st.write(f"*Using {len(df)} historical draws • Half-life = {decay} draws*")
-    for i, s in enumerate(predictions, start=1):
-        badges = " ".join(render_badge(n, hot_numbers) for n in s)
-        st.markdown(f"<div style='white-space:nowrap'><b>Set {i}</b> — {badges}</div>",
-                    unsafe_allow_html=True)
-    st.caption("Set 1 is the deterministic top-weighted set. Others are weighted samples for diversity.")
-
-with tab_compare:
-    st.header("Actual vs Predicted (latest dated draw)")
-    df_sorted = df.sort_values(by='date', ascending=False, na_position='last').reset_index(drop=True)
-    latest_idx = df_sorted['date'].first_valid_index()
-    if latest_idx is None:
-        latest_idx = 0
-    latest_row = df_sorted.iloc[latest_idx]
-    actual = [int(latest_row[f"n{i}"]) for i in range(1, NUMBERS_PER_DRAW + 1)]
-
-    records = []
-    best_pos = best_ov = best_dist = 0.0
-    for i, pred in enumerate(predictions, start=1):
-        pos = position_match_pct(pred, actual)
-        ov = closeness_overlap_pct(pred, actual)
-        dist = avg_min_distance_score(pred, actual)
-        best_pos = max(best_pos, pos)
-        best_ov = max(best_ov, ov)
-        best_dist = max(best_dist, dist)
-        records.append({
-            "Prediction Set": i,
-            "Predicted": ", ".join(map(str, pred)),
-            "Actual (latest)": ", ".join(map(str, actual)),
-            "Position Match (%)": round(pos, 2),
-            "Overlap (%)": round(ov, 2),
-            "Distance Score (%)": round(dist, 2)
-        })
-    comp_df = pd.DataFrame(records)
-    st.dataframe(comp_df, use_container_width=True)
-
-    latest_date_str = (latest_row['date'].strftime('%Y-%m-%d') if pd.notna(latest_row['date']) else "Unknown")
-    st.markdown(
-        f"""
-        <div style='background:#f6f9ff;padding:15px;border-radius:10px;margin-top:10px'>
-        <b>📅 Latest Draw:</b> {latest_date_str}<br>
-        <b>🎯 Best Position Match:</b> {best_pos:.2f}%<br>
-        <b>🔁 Best Overlap Match:</b> {best_ov:.2f}%<br>
-        <b>📏 Closest Distance Score:</b> {best_dist:.2f}%
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.subheader("Backtest (last 20 draws • top-weighted set only)")
-    N = min(20, len(df_sorted) - 1) if len(df_sorted) > 1 else 0
-    bt_rows = []
-    for k in range(N):
-        history = df_sorted.iloc[k + 1:].reset_index(drop=True)
-        if history.empty:
-            continue
-        wfreq_k = weighted_frequency(history, half_life_draws=decay)
-        top_set_k = wfreq_k['Number'].head(NUMBERS_PER_DRAW).tolist()
-        actual_k = [int(df_sorted.iloc[k][f"n{i}"]) for i in range(1, NUMBERS_PER_DRAW + 1)]
-        bt_rows.append({
-            "Draw Date": df_sorted.iloc[k]['date'].strftime('%Y-%m-%d') if pd.notna(df_sorted.iloc[k]['date']) else "",
-            "Predicted (top-weighted)": ", ".join(map(str, top_set_k)),
-            "Actual": ", ".join(map(str, actual_k)),
-            "Position Match (%)": round(position_match_pct(top_set_k, actual_k), 2),
-            "Overlap (%)": round(closeness_overlap_pct(top_set_k, actual_k), 2),
-            "Distance Score (%)": round(avg_min_distance_score(top_set_k, actual_k), 2)
-        })
-    if bt_rows:
-        st.dataframe(pd.DataFrame(bt_rows), use_container_width=True)
-    else:
-        st.info("Not enough dated draws to backtest.")
-
-with tab_past:
-    st.header("Past Draws (collapsed by default)")
-    with st.expander("Show full past draws table (click to expand)", expanded=False):
-        display_df = df.copy()
-        display_df['date'] = pd.to_datetime(display_df['date'], errors='coerce', dayfirst=True)
-        display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
-        cols = ['date'] + [f"n{i}" for i in range(1, NUMBERS_PER_DRAW + 1)]
-        display_df = display_df[cols]
-        st.dataframe(display_df.sort_values(by='date', ascending=False, na_position='last').reset_index(drop=True),
-                     use_container_width=True)
-
-        buf = io.StringIO()
-        display_df.to_csv(buf, index=False)
-        st.download_button("Download past_results.csv", buf.getvalue(),
-                           file_name="past_results.csv", mime="text/csv")
-
-with tab_freq:
-    st.header("Recency-Weighted Number Strength")
-    fig = px.bar(wfreq, x='Number', y='Weight', title='Recency-Weighted Number Strength',
-                 labels={'Weight': 'Weighted Frequency'})
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Raw Frequency (all history, unweighted)")
-    all_nums = []
-    for i in range(1, NUMBERS_PER_DRAW + 1):
-        col = f"n{i}"
-        if col in df.columns:
-            all_nums.extend(df[col].dropna().astype(int).tolist())
-    cnt = Counter(all_nums)
-    raw_freq = pd.DataFrame(sorted(cnt.items()), columns=['Number', 'Frequency'])
-    fig2 = px.bar(raw_freq, x='Number', y='Frequency', title='Raw Frequency')
-    st.plotly_chart(fig2, use_container_width=True)
-
-st.caption("Disclaimer: This tool uses historical data and probabilistic methods. No guarantees of winnings.")
+    st.markdown("---")
+    st.subheader("🔀 Signal Weights")
+    w_recency  = st.slider("Recency frequency",       0, 100, DEFAULT_W_RECEN
