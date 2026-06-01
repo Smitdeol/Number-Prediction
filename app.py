@@ -1,248 +1,333 @@
 # ============================================================
 #  Magnum Life AI Predictor — Streamlit App
-#  FREE VERSION — Uses Google Gemini API (free tier)
-#  Free limit: 15 requests/min, 1500/day — more than enough
+#  FREE VERSION — Google Gemini 2.0 Flash
 #
-#  Setup: get free key at https://aistudio.google.com/apikey
+#  Scraper targets lottolyzer.com number-view page
+#  which renders numbers as individual <td> cells in a table
 # ============================================================
 
 import streamlit as st
 import requests
-import json
-import re
-import time
-from collections import Counter
-from bs4 import BeautifulSoup
+import json, re, time
 import pandas as pd
+from bs4 import BeautifulSoup
+from collections import Counter
 
-# ── Page config ──────────────────────────────────────────────
-st.set_page_config(
-    page_title="Magnum Life AI Predictor",
-    page_icon="🎱",
-    layout="centered",
-)
+st.set_page_config(page_title="Magnum Life AI Predictor", page_icon="🎱", layout="centered")
 
-LAST_PAGE = 24
-BASE_URL  = "https://en.lottolyzer.com/history/malaysia/magnum-life/page/{page}/per-page/50/number-view"
-HEADERS   = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+# ── Constants ─────────────────────────────────────────────────
+BASE_URL    = "https://en.lottolyzer.com/history/malaysia/magnum-life/page/{page}/per-page/50/number-view"
+LAST_PAGE   = 24   # 24 pages × 50 draws = ~1,200 draws total
+GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
+HEADERS     = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://en.lottolyzer.com/",
+}
 
 # ── Styling ───────────────────────────────────────────────────
 st.markdown("""
 <style>
 body, .stApp { background-color: #0C0C14; color: #ffffff; }
-.ball {
-    display:inline-flex; align-items:center; justify-content:center;
-    width:40px; height:40px; border-radius:50%;
-    font-weight:900; font-size:0.95rem; margin:3px;
-}
+.ball { display:inline-flex; align-items:center; justify-content:center;
+        width:40px; height:40px; border-radius:50%;
+        font-weight:900; font-size:0.95rem; margin:3px; }
 .b-normal { background:#1E1E30; color:#fff; }
 .b-gold   { background:linear-gradient(135deg,#b8860b,#FFD700); color:#000; box-shadow:0 3px 10px rgba(255,215,0,.3); }
 .b-red    { background:linear-gradient(135deg,#FF3B3B,#ff6b6b); color:#fff; box-shadow:0 3px 10px rgba(255,59,59,.4); }
 .b-hot    { background:#FF6B3520; border:1.5px solid #FF6B35; color:#FF6B35; }
 .b-cold   { background:#4FC3F720; border:1.5px solid #4FC3F7; color:#4FC3F7; }
-.pred-card      { background:#13131F; border:1.5px solid #1E1E30; border-radius:14px; padding:16px; margin-bottom:12px; }
-.pred-card-best { background:linear-gradient(135deg,#1a1500,#13131F); border:1.5px solid #FFD70055; border-radius:14px; padding:16px; margin-bottom:12px; }
+.pred-best { background:linear-gradient(135deg,#1a1500,#13131F); border:1.5px solid #FFD70055; border-radius:14px; padding:16px; margin-bottom:12px; }
+.pred-card { background:#13131F; border:1.5px solid #1E1E30; border-radius:14px; padding:16px; margin-bottom:12px; }
 .tag-h { background:#1a3a1a; color:#4CAF50; padding:2px 8px; border-radius:5px; font-size:0.65rem; font-weight:700; }
 .tag-m { background:#2a2010; color:#FFA726; padding:2px 8px; border-radius:5px; font-size:0.65rem; font-weight:700; }
 .draw-row { background:#13131F; border:1px solid #1E1E30; border-radius:8px; padding:8px 12px; margin-bottom:5px; }
 .sec-label { color:#444; font-size:0.62rem; letter-spacing:3px; text-transform:uppercase; margin:16px 0 8px; }
-.disclaimer { background:#090909; border:1px solid #181818; border-radius:8px; padding:12px; color:#2a2a2a; font-size:0.65rem; text-align:center; margin-top:20px; }
-.free-badge { background:#1a3a1a; color:#4CAF50; border:1px solid #4CAF5044; border-radius:8px; padding:6px 12px; font-size:0.7rem; text-align:center; margin-bottom:16px; }
+.disclaimer { background:#090909; border:1px solid #181818; border-radius:8px; padding:12px; color:#333; font-size:0.65rem; text-align:center; margin-top:20px; }
+.stat-box { background:#13131F; border:1px solid #1E1E30; border-radius:10px; padding:14px; text-align:center; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── Helpers ───────────────────────────────────────────────────
-def balls_html(numbers, style="normal"):
-    cls = {"normal":"b-normal","gold":"b-gold","red":"b-red","hot":"b-hot","cold":"b-cold"}.get(style,"b-normal")
-    return "".join(f'<span class="ball {cls}">{n}</span>' for n in numbers)
+def balls(numbers, style="normal"):
+    c = {"normal":"b-normal","gold":"b-gold","red":"b-red","hot":"b-hot","cold":"b-cold"}.get(style,"b-normal")
+    return "".join(f'<span class="ball {c}">{n}</span>' for n in numbers)
 
 def extract_json(raw):
     s = re.sub(r'```json|```', '', raw, flags=re.IGNORECASE).strip()
-    start, end = s.find('{'), s.rfind('}')
-    if start == -1 or end == -1:
+    a, b = s.find('{'), s.rfind('}')
+    if a == -1 or b == -1:
         raise ValueError("No JSON found in AI response")
-    return json.loads(s[start:end+1])
+    return json.loads(s[a:b+1])
 
-# ── FREE AI call — Google Gemini ──────────────────────────────
-def call_gemini(prompt: str, api_key: str) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 4000}
-    }
-    r = requests.post(url, json=body, timeout=60)
-    if r.status_code == 401:
-        raise ValueError("Invalid Gemini API key. Check your key at aistudio.google.com")
-    if r.status_code == 429:
-        raise ValueError("Rate limit hit. Wait 1 minute and try again.")
-    if not r.ok:
-        raise ValueError(f"Gemini API error {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+# ── Scraper — lottolyzer number-view layout ───────────────────
+def scrape_page(page: int) -> list:
+    """
+    Lottolyzer number-view layout:
+    Each draw = one <tr> row
+    First <td> = draw number or date
+    Remaining <td> cells = individual numbers (1-36)
+    Last number in each row = Life Ball
+    """
+    rows   = []
+    url    = BASE_URL.format(page=page)
+    resp   = requests.get(url, headers=HEADERS, timeout=15)
 
-# ── Scraper ───────────────────────────────────────────────────
-def scrape_all_history(last_page=LAST_PAGE):
-    rows = []
-    for page in range(1, last_page + 1):
-        try:
-            url  = BASE_URL.format(page=page)
-            resp = requests.get(url, headers=HEADERS, timeout=10)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for tr in soup.select("table tbody tr"):
-                tds  = tr.find_all("td")
-                if len(tds) < 3:
-                    continue
-                date_raw = tds[0].get_text(strip=True)
-                nums = [int(td.get_text(strip=True)) for td in tds[1:]
-                        if td.get_text(strip=True).isdigit()
-                        and 1 <= int(td.get_text(strip=True)) <= 36]
-                if len(nums) >= 9:
-                    rows.append({
-                        "date":    date_raw,
-                        "numbers": sorted(nums[:8]),
-                        "lifeBall": nums[8],
-                    })
-            time.sleep(0.3)
-        except Exception:
+    if resp.status_code != 200:
+        return rows
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Find the results table — lottolyzer uses class 'table' or similar
+    table = (
+        soup.find("table", {"class": re.compile(r"table|result|history", re.I)})
+        or soup.find("table")
+    )
+    if not table:
+        return rows
+
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 5:
             continue
 
-    df = pd.DataFrame(rows)
-    if not df.empty and "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.sort_values("date", ascending=False, na_position="last")
-        df = df.dropna(subset=["date"])
-        df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-    return df
+        # Extract date — first cell
+        date_text = tds[0].get_text(strip=True)
 
-# ── AI: analyse + predict ─────────────────────────────────────
-def ai_analyse_and_predict(draws: list, api_key: str) -> dict:
-    has_data  = len(draws) >= 5
-    draw_json = json.dumps(draws[:50]) if has_data else "[]"
+        # Extract all numbers from remaining cells
+        nums = []
+        for td in tds[1:]:
+            txt = td.get_text(strip=True)
+            # Handle cells that may contain multiple numbers separated by space
+            for token in txt.split():
+                if token.isdigit():
+                    n = int(token)
+                    if 1 <= n <= 36:
+                        nums.append(n)
 
-    prompt = f"""You are a Magnum Life lottery analyst for Malaysia.
+        # Need at least 9 numbers (8 main + 1 life ball)
+        if len(nums) >= 9:
+            rows.append({
+                "date":     date_text,
+                "numbers":  sorted(nums[:8]),
+                "lifeBall": nums[8],
+            })
 
-Magnum Life rules: 8 main numbers from 1-36, 1 Life Ball from 1-36. Weekly Wednesday draw.
+    return rows
 
-{"DRAW HISTORY (" + str(len(draws)) + " draws):" if has_data else "No scraped data — generate 25 realistic draws first."}
-{draw_json}
+def scrape_all(last_page: int = LAST_PAGE, progress_bar=None) -> pd.DataFrame:
+    all_rows = []
+    for page in range(1, last_page + 1):
+        page_rows = scrape_page(page)
+        all_rows.extend(page_rows)
+        if progress_bar:
+            progress_bar.progress(page / last_page, text=f"Scraping page {page}/{last_page} — {len(all_rows)} draws found")
+        time.sleep(0.4)   # polite delay between requests
 
-Tasks:
-1. {"Analyse the above draws" if has_data else "Generate 25 realistic weekly draws (most recent: 2026-06-04)"}
-2. Count frequency — top 8 hot numbers, bottom 8 cold numbers
-3. Top 3 Life Ball numbers by frequency
-4. Average odd/even count per draw (1 decimal)
-5. Generate 3 prediction sets — EXACTLY 8 unique numbers each from 1-36
+    if not all_rows:
+        return pd.DataFrame()
 
-Return ONLY raw JSON, zero markdown, zero extra text before or after:
+    df = pd.DataFrame(all_rows)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    df = df.sort_values("date", ascending=False)
+    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+    df = df.drop_duplicates(subset=["date"])
+    return df.reset_index(drop=True)
+
+# ── Local statistics (pure Python — no AI needed) ─────────────
+def compute_stats(df: pd.DataFrame) -> dict:
+    all_nums   = [n for nums in df["numbers"] for n in nums]
+    all_lbs    = list(df["lifeBall"])
+    freq       = Counter(all_nums)
+    lb_freq    = Counter(all_lbs)
+
+    hot        = [n for n, _ in freq.most_common(8)]
+    cold_all   = [n for n, _ in freq.most_common()]
+    cold       = [n for n, _ in freq.most_common()[:-9:-1]]  # bottom 8
+
+    # Gap analysis — draws since each number last appeared
+    all_numbers_flat = list(df["numbers"])
+    gaps = {}
+    for n in range(1, 37):
+        gap = next((i for i, nums in enumerate(all_numbers_flat) if n in nums), len(df))
+        gaps[n] = gap
+    most_overdue = sorted(gaps, key=gaps.get, reverse=True)[:8]
+
+    # Odd / even average
+    odd_counts  = [sum(1 for n in nums if n % 2 != 0) for nums in df["numbers"]]
+    even_counts = [sum(1 for n in nums if n % 2 == 0) for nums in df["numbers"]]
+
+    return {
+        "hotNumbers":        hot,
+        "coldNumbers":       cold,
+        "overdueNumbers":    most_overdue,
+        "hotLifeBalls":      [n for n, _ in lb_freq.most_common(3)],
+        "totalDraws":        len(df),
+        "avgOdd":            round(sum(odd_counts)  / len(odd_counts),  1),
+        "avgEven":           round(sum(even_counts) / len(even_counts), 1),
+        "numberFrequency":   dict(freq),
+        "gaps":              gaps,
+    }
+
+# ── Gemini AI — predict using real stats ──────────────────────
+def call_gemini(prompt: str, api_key: str, retry: bool = True):
+    url  = GEMINI_URL.format(key=api_key)
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 4000},
+    }
+    r = requests.post(url, json=body, timeout=90)
+    if r.status_code == 429:
+        return None, "rate_limit"
+    if r.status_code == 401:
+        raise ValueError("Invalid Gemini API key")
+    if not r.ok:
+        raise ValueError(f"Gemini error {r.status_code}: {r.text[:150]}")
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"], "ok"
+
+def ai_predict(stats: dict, api_key: str) -> dict:
+    prompt = f"""You are a Magnum Life lottery prediction expert for Malaysia.
+
+Magnum Life rules: 8 main numbers from 1–36, 1 Life Ball from 1–36. Weekly Wednesday draw.
+
+REAL HISTORICAL STATISTICS (scraped from {stats['totalDraws']} actual draws):
+
+Hot numbers (most frequent): {stats['hotNumbers']}
+Cold numbers (least frequent): {stats['coldNumbers']}
+Most overdue numbers (draws since last appeared): {stats['overdueNumbers']}
+Hot Life Balls: {stats['hotLifeBalls']}
+Average odd per draw: {stats['avgOdd']}
+Average even per draw: {stats['avgEven']}
+Full frequency table: {stats['numberFrequency']}
+Gap table (draws since last seen): {stats['gaps']}
+
+Using ALL the above real data, apply these strategies to generate 3 prediction sets:
+1. Hot strategy — favour most frequent numbers
+2. Balanced — mix hot + cold + correct odd/even ratio
+3. Due strategy — favour most overdue numbers
+
+Return ONLY raw JSON, no markdown:
 {{
-  "draws":[{{"date":"YYYY-MM-DD","numbers":[n1,n2,n3,n4,n5,n6,n7,n8],"lifeBall":n}}],
-  "analysis":{{
-    "hotNumbers":[8 ints],
-    "coldNumbers":[8 ints],
-    "hotLifeBalls":[3 ints],
-    "totalDrawsAnalysed":N,
-    "avgOdd":N,
-    "avgEven":N
-  }},
   "predictions":[
-    {{"strategy":"🔥 Hot Numbers","numbers":[8 sorted ints],"lifeBall":N,"confidence":"High","reason":"short reason"}},
-    {{"strategy":"⚖️ Balanced Mix","numbers":[8 sorted ints],"lifeBall":N,"confidence":"High","reason":"short reason"}},
-    {{"strategy":"❄️ Due Numbers","numbers":[8 sorted ints],"lifeBall":N,"confidence":"Medium","reason":"short reason"}}
+    {{"strategy":"🔥 Hot Numbers","numbers":[8 sorted unique ints 1-36],"lifeBall":N,"confidence":"High","reason":"one line"}},
+    {{"strategy":"⚖️ Balanced Mix","numbers":[8 sorted unique ints 1-36],"lifeBall":N,"confidence":"High","reason":"one line"}},
+    {{"strategy":"❄️ Due Numbers","numbers":[8 sorted unique ints 1-36],"lifeBall":N,"confidence":"Medium","reason":"one line"}}
   ],
   "nextDraw":"YYYY-MM-DD"
 }}"""
 
-    raw    = call_gemini(prompt, api_key)
-    result = extract_json(raw)
-    if not result.get("predictions"):
-        raise ValueError("Predictions missing from AI response")
-    return result
+    raw, status = call_gemini(prompt, api_key)
+    if status == "rate_limit":
+        return None, "rate_limit"
+    return extract_json(raw), "ok"
 
-# ── UI ────────────────────────────────────────────────────────
+# ── UI ─────────────────────────────────────────────────────────
 st.markdown("""
 <div style="text-align:center;padding:24px 0 10px">
   <div style="color:#FFD700;font-size:.7rem;letter-spacing:4px;text-transform:uppercase;margin-bottom:6px">Malaysia</div>
-  <h1 style="margin:0;font-size:2.6rem;font-weight:900;letter-spacing:2px">
-    MAGNUM <span style="color:#FFD700">LIFE</span>
-  </h1>
+  <h1 style="margin:0;font-size:2.6rem;font-weight:900;letter-spacing:2px">MAGNUM <span style="color:#FFD700">LIFE</span></h1>
   <div style="color:#555;font-size:.65rem;letter-spacing:3px;text-transform:uppercase;margin-top:6px">AI Number Predictor</div>
-  <div style="color:#333;font-size:.6rem;margin-top:4px">lottolyzer.com · Powered by Google Gemini (Free)</div>
+  <div style="color:#333;font-size:.6rem;margin-top:4px">Real data from lottolyzer.com · Google Gemini AI (Free)</div>
 </div>
 <hr style="border-color:#1E1E30">
 """, unsafe_allow_html=True)
 
-# ── API key check ─────────────────────────────────────────────
+# ── API Key check ─────────────────────────────────────────────
 api_key = st.secrets.get("GEMINI_API_KEY", "")
 if not api_key:
     st.markdown("""
 <div style="background:#1a1a00;border:1px solid #FFD70044;border-radius:12px;padding:20px;margin:10px 0">
-  <div style="color:#FFD700;font-weight:700;font-size:1rem;margin-bottom:10px">⚙️ Free Setup Required</div>
-  <div style="color:#aaa;font-size:0.8rem;line-height:1.8">
-    1. Go to <b style="color:#4FC3F7">aistudio.google.com/apikey</b><br>
-    2. Sign in with Google (free)<br>
-    3. Click <b>Create API Key</b> → copy it<br>
-    4. In Streamlit → <b>Manage App → Settings → Secrets</b><br>
-    5. Paste: <code>GEMINI_API_KEY = "your-key-here"</code><br>
-    6. Save → done ✅
+  <div style="color:#FFD700;font-weight:700;margin-bottom:10px">⚙️ One-time Free Setup</div>
+  <div style="color:#aaa;font-size:0.82rem;line-height:2">
+    1️⃣ Go to <b style="color:#4FC3F7">aistudio.google.com/apikey</b><br>
+    2️⃣ Sign in with Google (100% free)<br>
+    3️⃣ Click <b>Create API Key</b> → copy it<br>
+    4️⃣ Streamlit → <b>Manage App → Settings → Secrets</b><br>
+    5️⃣ Add: <code>GEMINI_API_KEY = "AIzaSy..."</code><br>
+    6️⃣ Save ✅
   </div>
-</div>
-""", unsafe_allow_html=True)
+</div>""", unsafe_allow_html=True)
     st.stop()
 
-st.markdown('<div class="free-badge">✅ Free Tier Active — Google Gemini AI</div>', unsafe_allow_html=True)
+st.markdown('<div style="background:#0d1f0d;border:1px solid #4CAF5033;border-radius:8px;padding:8px 14px;font-size:0.72rem;color:#4CAF50;margin-bottom:16px;text-align:center">✅ Free Tier Active — Google Gemini 2.0 Flash</div>', unsafe_allow_html=True)
 
 if st.button("⚡  FETCH & PREDICT", use_container_width=True, type="primary"):
     with st.status("Running...", expanded=True) as status_ui:
 
-        # Scrape
-        st.write("🌐 Scraping Lottolyzer.com...")
-        df = scrape_all_history(last_page=LAST_PAGE)
+        # ── Step 1: Scrape real data ──────────────────────────
+        st.write("🌐 Scraping all pages from Lottolyzer.com...")
+        pbar = st.progress(0, text="Starting...")
+        df   = scrape_all(last_page=LAST_PAGE, progress_bar=pbar)
+        pbar.empty()
 
-        if not df.empty:
-            st.write(f"✅ Scraped {len(df)} draws from Lottolyzer")
-            draws_list = df.to_dict("records")
-        else:
-            st.write("⚠️ Scrape returned no data — AI will generate baseline draws")
-            draws_list = []
+        if df.empty:
+            st.error("❌ Could not scrape Lottolyzer. The site may be temporarily down. Try again in a few minutes.")
+            st.stop()
 
-        # AI analyse
-        st.write("🧠 AI analysing & generating predictions...")
-        try:
-            result    = ai_analyse_and_predict(draws_list, api_key)
-            draws_out = result.get("draws",  draws_list[:10] if draws_list else [])
-            analysis  = result.get("analysis", {})
-            preds     = result.get("predictions", [])
-            next_draw = result.get("nextDraw", "Next Wednesday")
+        st.write(f"✅ {len(df)} real draws scraped from {LAST_PAGE} pages")
 
-            st.write(f"✅ {analysis.get('totalDrawsAnalysed', len(draws_out))} draws analysed")
-            status_ui.update(label="✅ Predictions ready!", state="complete")
+        # ── Step 2: Compute stats locally (no AI needed) ──────
+        st.write("🔍 Computing frequency, gaps & patterns...")
+        stats = compute_stats(df)
+        st.write(f"✅ Stats computed — {stats['totalDraws']} draws analysed")
 
-            # Stats
-            st.markdown('<div class="sec-label">📊 Overview</div>', unsafe_allow_html=True)
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Draws",    analysis.get("totalDrawsAnalysed", len(draws_out)))
-            c2.metric("Odd/Even", f"{analysis.get('avgOdd','?')} / {analysis.get('avgEven','?')}")
-            c3.metric("Next Draw",next_draw)
+        # ── Step 3: AI predictions using real stats ───────────
+        st.write("🧠 AI generating predictions from real data...")
+        result, ai_status = ai_predict(stats, api_key)
 
-            # Hot & Cold
-            st.markdown('<div class="sec-label">🔥 Hot &nbsp; ❄️ Cold</div>', unsafe_allow_html=True)
-            col_h, col_c = st.columns(2)
-            with col_h:
-                st.markdown(balls_html(analysis.get("hotNumbers",[]),"hot"), unsafe_allow_html=True)
-            with col_c:
-                st.markdown(balls_html(analysis.get("coldNumbers",[]),"cold"), unsafe_allow_html=True)
+        if ai_status == "rate_limit":
+            st.write("⏳ Rate limit — auto-retrying in 65 seconds...")
+            prog = st.progress(0)
+            for i in range(65):
+                time.sleep(1)
+                prog.progress((i+1)/65, text=f"Waiting {64-i}s...")
+            prog.empty()
+            result, _ = ai_predict(stats, api_key)
 
-            # Predictions
-            st.markdown('<div class="sec-label">🎯 Predictions — Next Draw</div>', unsafe_allow_html=True)
-            for i, p in enumerate(preds):
-                card  = "pred-card-best" if i == 1 else "pred-card"
-                ctag  = "tag-h" if p.get("confidence") == "High" else "tag-m"
-                best  = '<span style="background:#FFD700;color:#000;font-size:.55rem;font-weight:900;padding:2px 7px;border-radius:4px;margin-left:6px">BEST BET</span>' if i == 1 else ""
-                tc    = "#FFD700" if i == 1 else "#cccccc"
-                mb    = balls_html(p.get("numbers",[]), "gold" if i==1 else "normal")
-                lb    = balls_html([p.get("lifeBall","?")], "red")
+        if not result:
+            st.error("❌ AI prediction failed. Try again in 1 minute.")
+            st.stop()
 
-                st.markdown(f"""
+        preds     = result.get("predictions", [])
+        next_draw = result.get("nextDraw", "Next Wednesday")
+        status_ui.update(label="✅ Done!", state="complete")
+
+        # ── Stats overview ────────────────────────────────────
+        st.markdown('<div class="sec-label">📊 Real Data Overview</div>', unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Draws Analysed", stats["totalDraws"])
+        c2.metric("Avg Odd / Even",  f"{stats['avgOdd']} / {stats['avgEven']}")
+        c3.metric("Next Draw",       next_draw)
+
+        # ── Hot, Cold, Overdue ────────────────────────────────
+        st.markdown('<div class="sec-label">🔥 Hot Numbers</div>', unsafe_allow_html=True)
+        st.markdown(balls(stats["hotNumbers"], "hot"), unsafe_allow_html=True)
+
+        st.markdown('<div class="sec-label">❄️ Cold Numbers</div>', unsafe_allow_html=True)
+        st.markdown(balls(stats["coldNumbers"], "cold"), unsafe_allow_html=True)
+
+        st.markdown('<div class="sec-label">⏰ Most Overdue Numbers</div>', unsafe_allow_html=True)
+        st.markdown(balls(stats["overdueNumbers"], "normal"), unsafe_allow_html=True)
+
+        st.markdown('<div class="sec-label">🔴 Hot Life Balls</div>', unsafe_allow_html=True)
+        st.markdown(balls(stats["hotLifeBalls"], "red"), unsafe_allow_html=True)
+
+        # ── Predictions ───────────────────────────────────────
+        st.markdown('<div class="sec-label">🎯 AI Predictions — Based on Real Data</div>', unsafe_allow_html=True)
+        for i, p in enumerate(preds):
+            card = "pred-best" if i == 1 else "pred-card"
+            ctag = "tag-h" if p.get("confidence") == "High" else "tag-m"
+            best = '<span style="background:#FFD700;color:#000;font-size:.55rem;font-weight:900;padding:2px 7px;border-radius:4px;margin-left:6px">BEST BET</span>' if i == 1 else ""
+            tc   = "#FFD700" if i == 1 else "#cccccc"
+            mb   = balls(p.get("numbers",[]), "gold" if i == 1 else "normal")
+            lb   = balls([p.get("lifeBall","?")], "red")
+
+            st.markdown(f"""
 <div class="{card}">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
     <span style="font-weight:700;font-size:.95rem;color:{tc}">{p.get('strategy','')} {best}</span>
@@ -255,22 +340,17 @@ if st.button("⚡  FETCH & PREDICT", use_container_width=True, type="primary"):
     <span style="color:#333;font-size:.72rem;font-style:italic">{p.get('reason','')}</span>
   </div>
 </div>""", unsafe_allow_html=True)
-                st.code(f"Numbers: {', '.join(map(str,p.get('numbers',[])))}  |  Life Ball: {p.get('lifeBall','?')}", language=None)
+            st.code(f"Numbers: {', '.join(map(str, p.get('numbers',[])))}  |  Life Ball: {p.get('lifeBall','?')}", language=None)
 
-            # Recent draws
-            if draws_out:
-                st.markdown('<div class="sec-label">📅 Recent Draw History</div>', unsafe_allow_html=True)
-                for d in draws_out[:10]:
-                    nb = balls_html(d.get("numbers",[]), "normal")
-                    lb = balls_html([d.get("lifeBall","?")], "red")
-                    st.markdown(f"""
+        # ── Recent draws ──────────────────────────────────────
+        st.markdown('<div class="sec-label">📅 Recent Draw History</div>', unsafe_allow_html=True)
+        for _, row in df.head(10).iterrows():
+            nb = balls(row["numbers"], "normal")
+            lb = balls([row["lifeBall"]], "red")
+            st.markdown(f"""
 <div class="draw-row">
-  <span style="color:#444;font-size:.68rem;margin-right:8px">{d.get('date','')}</span>
+  <span style="color:#444;font-size:.68rem;margin-right:8px">{row['date']}</span>
   {nb} {lb}
 </div>""", unsafe_allow_html=True)
 
-            st.markdown('<div class="disclaimer">⚠️ For entertainment only. Lottery results are random. Play responsibly.</div>', unsafe_allow_html=True)
-
-        except Exception as e:
-            st.error(f"❌ AI Error: {e}")
-                
+        st.markdown('<div class="disclaimer">⚠️ For entertainment only. Lottery results are random. Play responsibly.</div>', unsafe_allow_html=True)
